@@ -1,0 +1,16 @@
+services:
+  warehouse:
+    build: .
+    image: bus-route-warehouse:local
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/warehouse.db
+      # 打开演示故障注入开关，便于在 /docs 验证写入失败整体回滚。
+      ENABLE_FAULT_INJECTION: "true"
+    volumes:
+      - warehouse-data:/data
+    restart: unless-stopped
+
+volumes:
+  warehouse-data:

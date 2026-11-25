@@ -1,0 +1,119 @@
+# 公交线路互换与客流数仓
+
+两家公交公司互换一批线路，下游客流数仓仍按**原市级线路号**关联。服务用 FastAPI + SQLite
+接收两家公司各自上报的 JSON 全量线路停站表，办理换线单，并对外提供“线路 → 运营方 + 停站顺序”。
+
+## 启动
+
+```bash
+docker compose up --build
+```
+
+- Swagger 文档与在线调试：<http://127.0.0.1:8000/docs>
+- 数据落在命名卷 `warehouse-data`。重新演示前清库：`docker compose down -v`
+- 故障注入默认打开（`ENABLE_FAULT_INJECTION=true`），便于在 `/docs` 里演示“写入失败整体回滚”。
+
+不开 Docker 时本地运行：
+
+```bash
+python3 -m pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+运行测试：
+
+```bash
+python3 -m pip install pytest httpx
+python3 -m pytest -q
+```
+
+## 演示：两家错时上报与下游取数
+
+容器起来后，另开终端执行：
+
+```bash
+python3 demo/demo.py http://127.0.0.1:8000
+```
+
+脚本按以下顺序调用 API，并打印每一步的下游取数与批次保留情况：
+
+1. 一公司、二公司各自上报首批全量线路表（101/102 归 A，201 归 B）。
+2. 开换线单：101 由 A 交给 B。
+3. A 先上报，撤下 101 并刷新单外的 102。此时 101 在取数中**冻结**在 A 撤销前的明细，102 立即用新表。
+4. B 后上报，报齐 101 的新停站表。双方条件满足，归属与停站顺序**同一事务切换**。
+5. A 再重报 101，归属**不回退**，仍归 B。
+6. 带 `?inject_fault=true` 上报一批新线路，返回 500；取数、批次、换线单状态均保持不变。
+7. 列出两家公司批次：旧批只剩继续供数所需的停站明细。
+
+也可以直接在 `/docs` 里按同样顺序手工点。
+
+## API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/companies/{code}/batches` | 上报全量快照；`batch_number` 可省略（服务端 +1） |
+| GET | `/companies/{code}/batches` | 批次列表、停站行数、已裁剪行数 |
+| GET | `/companies` | 已登记公司 |
+| GET | `/routes` | 下游取数：所有在供线路的运营方与停站顺序 |
+| GET | `/routes/{route_code}` | 单条线路（含已撤下线路的最后归属） |
+| POST | `/transfer-orders` | 新建换线单，一次仅一张办理中 |
+| GET | `/transfer-orders/current` | 当前办理中的单据 |
+| GET | `/transfer-orders/{id}` | 单据详情与逐线办理条件 |
+| POST | `/transfer-orders/{id}/commit` | 手动提交（条件未满足返回 409；已提交幂等返回） |
+| POST | `/transfer-orders/{id}/cancel` | 取消单据 |
+| GET | `/health` | 健康检查 |
+
+上报示例：
+
+```json
+{
+  "batch_number": 2,
+  "routes": [
+    {
+      "route_code": "101路",
+      "stops": [
+        {"stop_code": "S001", "stop_name": "火车站"},
+        {"stop_code": "S002", "stop_name": "人民广场"}
+      ]
+    }
+  ]
+}
+```
+
+`routes` 是本公司**全量**在供线路：本批未出现的线路视为已撤下。线路号始终是市级编号，
+换线只改运营方与停站来源，不改编号。
+
+## 规则落地
+
+- **首报即归属**：新线路第一次出现在某公司快照中即归该公司（`route_ownership.first_company`）；
+  之后任何公司重报都不会改变归属，只有换线单提交会改 `owner_company`。
+- **批次号按公司递增**：省略时取该公司上一批 + 1；显式给重复或更小的值返回 409。
+  写入在 `BEGIN IMMEDIATE` 事务内完成，并发上报也会拿到不同且递增的号。
+- **一次一张换线单**：数据库部分唯一索引 `WHERE status='open'` 兜底。
+- **办理期取值**：
+  - 单内线路：用旧方**现行**（最新批次）停站表；旧方已撤下则冻结在其**撤下前最近一份**含该线路的明细。
+  - 单外线路：照常按最新批次刷新。
+- **切换条件**：每条线路都满足“旧方现行快照已无此线路”且“新方现行快照已有此线路”。
+  最后一份使条件齐备的上报会在**同一次事务**内自动提交；也可手动 `commit`（未齐备返回 409）。
+  提交时归属和停站来源一起切换，读写方看不到中间态。
+- **旧方重报不回退**：归属只在提交时变化；重报不会把线路要回去。
+- **旧批裁剪**：每次写入后，非最新批次的停站明细只保留仍被取数引用的行（含办理期内冻结线路所需的撤下前明细）；
+  其余明细删除，批次头、原始行数与裁剪行数保留用于审计。
+- **写入失败整体回滚**：批次、换线单状态、取数结果在同一事务；异常即 `ROLLBACK`。
+  演示开关 `ENABLE_FAULT_INJECTION=true` 时，请求加 `?inject_fault=true` 会在写完所有步骤后抛错，
+  用于验证回滚（生产环境请关闭）。
+
+## 数据模型
+
+- `companies`：公司代码与名称。
+- `batches` / `batch_stops`：不可变全量快照；停站按 `seq` 排序。
+- `route_ownership`：线路归属与首报方，换线只改这里。
+- `transfer_orders` / `transfer_lines`：换线单与逐线冻结批次。
+- `route_serving`：下游取数读模型（线路 → 运营方 + 来源批次 + 是否冻结），每次写入后重算。
+
+## 验证状态
+
+- 已实现：上述全部接口与规则、Docker Compose、演示脚本、30 个自动化测试。
+- 已实测：`pytest -q` 30 通过；本地 `uvicorn` 下 `demo/demo.py` 完整跑通错时上报、冻结、自动切换、回抢不回退、故障回滚与旧批裁剪。
+- 未验证：当前环境无 Docker，`docker compose up --build` 未实际执行；镜像与卷行为仅按标准 Dockerfile/Compose 配置提供。
+- 未实现（超出本次范围）：鉴权、公司主数据的增删接口、分页、快照级别的历史查询接口、生产级故障注入开关管理。
