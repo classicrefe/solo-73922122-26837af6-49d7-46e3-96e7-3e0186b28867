@@ -29,9 +29,14 @@ from typing import Any, Optional
 
 import sqlite3
 
-from .db import transaction
+from .db import read_transaction, transaction
 from .errors import ConflictError, InjectedFault, NotFoundError
 from .models import BatchIn, TransferOrderIn
+
+# Test hook: fired just before a create-order transaction commits, while the
+# write lock is still held. Lets timing tests park the writer so another
+# connection can observe the "write pending / receipt not returned" window.
+create_order_precommit_hook = None
 
 ROUTE_COLUMNS = """
     rs.route_code,
@@ -430,7 +435,10 @@ def create_transfer_order(
     conn: sqlite3.Connection,
     payload: TransferOrderIn,
     inject_fault: bool = False,
-) -> int:
+) -> dict[str, Any]:
+    """Create the order and return its receipt, all materialised in the same
+    transaction as the write. The receipt therefore reflects the state at the
+    order's own commit, never a later auto-commit by a concurrent report."""
     created_at = now_iso()
     with transaction(conn):
         if _open_order(conn) is not None:
@@ -490,14 +498,20 @@ def create_transfer_order(
         if inject_fault:
             raise InjectedFault()
 
-        return order_id
+        receipt = _load_order(conn, order_id)
+        if create_order_precommit_hook is not None:
+            # The write is complete but not committed; the lock is still held.
+            create_order_precommit_hook(order_id)
+        return receipt
 
 
 def cancel_transfer_order(
     conn: sqlite3.Connection,
     order_id: int,
     inject_fault: bool = False,
-) -> None:
+) -> dict[str, Any]:
+    """Cancel inside one write transaction and return the receipt built from
+    that same transaction's snapshot."""
     at = now_iso()
     with transaction(conn):
         order = _order_row(conn, order_id)
@@ -511,6 +525,21 @@ def cancel_transfer_order(
         prune_old_batches(conn)
         if inject_fault:
             raise InjectedFault()
+        return _load_order(conn, order_id)
+
+
+def commit_transfer_order(
+    conn: sqlite3.Connection,
+    order_id: int,
+    inject_fault: bool = False,
+) -> dict[str, Any]:
+    """Manual commit wrapper. The returned receipt comes from the committing
+    transaction, so it can never report a state different from the write."""
+    with transaction(conn):
+        commit_order(conn, order_id)
+        if inject_fault:
+            raise InjectedFault()
+        return _load_order(conn, order_id)
 
 
 # ---------------------------------------------------------------------------
@@ -532,84 +561,90 @@ def _stops(
 
 
 def list_routes(conn: sqlite3.Connection) -> dict[str, Any]:
-    rows = conn.execute(
-        f"SELECT {ROUTE_COLUMNS} {ROUTE_FROM} ORDER BY rs.route_code"
-    ).fetchall()
-    routes = [
-        {
-            "route_code": row["route_code"],
-            "operator": row["operator"],
-            "operator_name": row["operator_name"],
-            "source_batch_id": row["source_batch_id"],
-            "source_batch_number": row["source_batch_number"],
-            "frozen": bool(row["is_frozen"]),
-            "stops": _stops(conn, row["source_batch_id"], row["route_code"]),
-        }
-        for row in rows
-    ]
+    # One snapshot for the whole response so every operator/stop pair comes
+    # from the same committed state (a commit between two statements cannot
+    # mix two supply states in a single response).
+    with read_transaction(conn):
+        rows = conn.execute(
+            f"SELECT {ROUTE_COLUMNS} {ROUTE_FROM} ORDER BY rs.route_code"
+        ).fetchall()
+        routes = [
+            {
+                "route_code": row["route_code"],
+                "operator": row["operator"],
+                "operator_name": row["operator_name"],
+                "source_batch_id": row["source_batch_id"],
+                "source_batch_number": row["source_batch_number"],
+                "frozen": bool(row["is_frozen"]),
+                "stops": _stops(conn, row["source_batch_id"], row["route_code"]),
+            }
+            for row in rows
+        ]
     return {"as_of": now_iso(), "routes": routes}
 
 
 def get_route(conn: sqlite3.Connection, route_code: str) -> dict[str, Any]:
-    ownership = conn.execute(
-        "SELECT * FROM route_ownership WHERE route_code = ?", (route_code,)
-    ).fetchone()
-    if ownership is None:
-        raise NotFoundError(f"unknown route: {route_code}")
-    serving = conn.execute(
-        f"SELECT {ROUTE_COLUMNS} {ROUTE_FROM} WHERE rs.route_code = ?", (route_code,)
-    ).fetchone()
+    with read_transaction(conn):
+        ownership = conn.execute(
+            "SELECT * FROM route_ownership WHERE route_code = ?", (route_code,)
+        ).fetchone()
+        if ownership is None:
+            raise NotFoundError(f"unknown route: {route_code}")
+        serving = conn.execute(
+            f"SELECT {ROUTE_COLUMNS} {ROUTE_FROM} WHERE rs.route_code = ?", (route_code,)
+        ).fetchone()
 
-    if serving is None:
+        if serving is None:
+            return {
+                "route_code": route_code,
+                "operator": ownership["owner_company"],
+                "operator_name": _company_name(conn, ownership["owner_company"]),
+                "in_supply": False,
+                "frozen": False,
+                "source_batch_id": None,
+                "source_batch_number": None,
+                "first_reported_by": ownership["first_company"],
+                "first_reported_at": ownership["first_reported_at"],
+                "stops": [],
+            }
+
         return {
             "route_code": route_code,
-            "operator": ownership["owner_company"],
-            "operator_name": _company_name(conn, ownership["owner_company"]),
-            "in_supply": False,
-            "frozen": False,
-            "source_batch_id": None,
-            "source_batch_number": None,
+            "operator": serving["operator"],
+            "operator_name": serving["operator_name"],
+            "in_supply": True,
+            "frozen": bool(serving["is_frozen"]),
+            "source_batch_id": serving["source_batch_id"],
+            "source_batch_number": serving["source_batch_number"],
             "first_reported_by": ownership["first_company"],
             "first_reported_at": ownership["first_reported_at"],
-            "stops": [],
+            "stops": _stops(conn, serving["source_batch_id"], route_code),
         }
-
-    return {
-        "route_code": route_code,
-        "operator": serving["operator"],
-        "operator_name": serving["operator_name"],
-        "in_supply": True,
-        "frozen": bool(serving["is_frozen"]),
-        "source_batch_id": serving["source_batch_id"],
-        "source_batch_number": serving["source_batch_number"],
-        "first_reported_by": ownership["first_company"],
-        "first_reported_at": ownership["first_reported_at"],
-        "stops": _stops(conn, serving["source_batch_id"], route_code),
-    }
 
 
 def list_batches(conn: sqlite3.Connection, company_code: str) -> dict[str, Any]:
-    _company_name(conn, company_code)
-    rows = conn.execute(
-        "SELECT * FROM batches WHERE company_code = ? ORDER BY batch_number",
-        (company_code,),
-    ).fetchall()
-    batches = []
-    for row in rows:
-        retained = conn.execute(
-            "SELECT COUNT(*) AS n FROM batch_stops WHERE batch_id = ?", (row["id"],)
-        ).fetchone()["n"]
-        batches.append(
-            {
-                "company_code": row["company_code"],
-                "batch_number": row["batch_number"],
-                "received_at": row["received_at"],
-                "route_count": row["route_count"],
-                "stop_count": row["stop_count"],
-                "pruned_stop_rows": row["pruned_stop_rows"],
-                "retained_stop_rows": retained,
-            }
-        )
+    with read_transaction(conn):
+        _company_name(conn, company_code)
+        rows = conn.execute(
+            "SELECT * FROM batches WHERE company_code = ? ORDER BY batch_number",
+            (company_code,),
+        ).fetchall()
+        batches = []
+        for row in rows:
+            retained = conn.execute(
+                "SELECT COUNT(*) AS n FROM batch_stops WHERE batch_id = ?", (row["id"],)
+            ).fetchone()["n"]
+            batches.append(
+                {
+                    "company_code": row["company_code"],
+                    "batch_number": row["batch_number"],
+                    "received_at": row["received_at"],
+                    "route_count": row["route_count"],
+                    "stop_count": row["stop_count"],
+                    "pruned_stop_rows": row["pruned_stop_rows"],
+                    "retained_stop_rows": retained,
+                }
+            )
     return {"company_code": company_code, "batches": batches}
 
 
@@ -650,7 +685,13 @@ def _line_detail(conn: sqlite3.Connection, line: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def get_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
+def _load_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
+    """Assemble the full order detail from the current transaction's snapshot.
+
+    Must be called inside an open transaction (a write transaction for
+    receipts, :func:`read_transaction` for GET endpoints). All statements then
+    see one consistent committed state.
+    """
     order = _order_row(conn, order_id)
     lines = [_line_detail(conn, line) for line in _order_lines(conn, order_id)]
     return {
@@ -663,17 +704,26 @@ def get_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
     }
 
 
+def get_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
+    with read_transaction(conn):
+        return _load_order(conn, order_id)
+
+
 def get_current_order(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
-    order = _open_order(conn)
-    if order is None:
-        return None
-    return get_order(conn, order["id"])
+    with read_transaction(conn):
+        order = _open_order(conn)
+        if order is None:
+            return None
+        return _load_order(conn, order["id"])
 
 
 def list_companies(conn: sqlite3.Connection) -> dict[str, Any]:
-    return {
-        "companies": [
-            {"code": row["code"], "name": row["name"]}
-            for row in conn.execute("SELECT code, name FROM companies ORDER BY code")
-        ]
-    }
+    with read_transaction(conn):
+        return {
+            "companies": [
+                {"code": row["code"], "name": row["name"]}
+                for row in conn.execute(
+                    "SELECT code, name FROM companies ORDER BY code"
+                ).fetchall()
+            ]
+        }

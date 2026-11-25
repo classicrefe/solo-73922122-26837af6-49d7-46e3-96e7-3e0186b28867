@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,9 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app import service  # noqa: E402
 from app.config import Settings  # noqa: E402
+from app.db import connect, read_transaction, transaction  # noqa: E402
 from app.main import create_app  # noqa: E402
 
 A = "company_a"
@@ -516,3 +519,239 @@ def test_duplicate_route_in_snapshot_is_rejected(client: TestClient) -> None:
 
 def test_unknown_route_lookup_404(client: TestClient) -> None:
     assert client.get("/routes/无此线路").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Receipt/snapshot timing: the withdrawal batch may finish the line switch
+# before the create/cancel receipt has been returned.
+# ---------------------------------------------------------------------------
+
+
+def test_create_receipt_reflects_its_own_commit_under_racing_report(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    seed_two_companies(client)
+    # B already supplies 101, so A's next withdrawal would auto-commit any
+    # open order for 101 the instant it lands.
+    report(client, B, 2, [route("201路", "公园", "医院"), route("101路", "新甲", "新乙")])
+
+    parked = threading.Event()
+    release = threading.Event()
+
+    def hook(order_id: int) -> None:
+        parked.set()
+        assert release.wait(timeout=5)
+
+    monkeypatch.setattr(service, "create_order_precommit_hook", hook)
+    receipts: dict[str, Any] = {}
+
+    def create_order() -> None:
+        receipts["create"] = new_order(client, [("101路", A, B)]).json()
+
+    def withdraw() -> None:
+        receipts["withdraw"] = report(
+            client, A, 2, [route("102路", "西站", "东站")]
+        ).json()
+
+    creator = threading.Thread(target=create_order)
+    creator.start()
+    assert parked.wait(timeout=5)
+
+    # The write is complete but the receipt has not returned. The withdrawal
+    # report queues on the create transaction's write lock instead of failing.
+    writer = threading.Thread(target=withdraw)
+    writer.start()
+    time.sleep(0.2)
+
+    release.set()
+    creator.join(timeout=5)
+    writer.join(timeout=5)
+
+    # The create receipt must show the state at ITS commit: still open.
+    create_receipt = receipts["create"]
+    assert create_receipt["status"] == "open"
+    assert create_receipt["ready"] is False
+    assert create_receipt["lines"][0]["operator"] == A
+    assert create_receipt["lines"][0]["serving_company"] == A
+
+    # The queued report then auto-commits normally.
+    assert receipts["withdraw"]["auto_committed_order"]["status"] == "committed"
+    order_id = create_receipt["id"]
+    final = client.get(f"/transfer-orders/{order_id}").json()
+    assert final["status"] == "committed"
+    assert final["lines"][0]["operator"] == B
+    assert final["lines"][0]["serving_company"] == B
+    assert routes_by_code(client)["101路"]["operator"] == B
+
+
+def test_order_reads_inside_snapshot_ignore_concurrent_commit(
+    env: tuple[Settings, TestClient],
+) -> None:
+    settings, client = env
+    seed_two_companies(client)
+    order_id = new_order(client, [("101路", A, B)]).json()["id"]
+    report(client, B, 2, [route("201路", "公园", "医院"), route("101路", "新甲", "新乙")])
+
+    raw = connect(settings)
+    try:
+        with read_transaction(raw):
+            before = service._load_order(raw, order_id)
+            assert before["status"] == "open"
+            assert before["lines"][0]["operator"] == A
+            assert before["lines"][0]["serving_company"] == A
+
+            # A read is in flight while the satisfying report auto-commits on
+            # another connection; the reader must not block the writer.
+            response = report(client, A, 2, [route("102路", "西站", "东站")])
+            assert response.status_code == 201
+            assert response.json()["auto_committed_order"]["status"] == "committed"
+
+            # Same snapshot, so the response cannot mix an open header with
+            # post-commit line conditions or serving party.
+            assert service._load_order(raw, order_id) == before
+        after = service.get_order(raw, order_id)
+    finally:
+        raw.close()
+
+    assert after["status"] == "committed"
+    assert after["lines"][0]["operator"] == B
+    assert after["lines"][0]["serving_company"] == B
+    assert after["lines"][0]["ready"] is True
+
+
+def test_concurrent_order_gets_never_mix_open_header_with_committed_lines(
+    client: TestClient,
+) -> None:
+    seed_two_companies(client)
+    report(client, B, 2, [route("201路", "公园", "医院"), route("101路", "新甲", "新乙")])
+    order_id = new_order(client, [("101路", A, B)]).json()["id"]
+
+    go = threading.Barrier(6)  # main + writer + four readers
+    stop = threading.Event()
+
+    def validate(order: dict[str, Any]) -> None:
+        if order["status"] == "open":
+            for line in order["lines"]:
+                assert line["operator"] == A
+                assert line["serving_company"] == A
+                assert line["ready"] is False
+        elif order["status"] == "committed":
+            for line in order["lines"]:
+                assert line["operator"] == B
+                assert line["serving_company"] == B
+                assert line["ready"] is True
+        else:
+            raise AssertionError(f"unexpected status {order['status']}")
+
+    def reader() -> None:
+        go.wait()
+        while not stop.is_set():
+            validate(client.get(f"/transfer-orders/{order_id}").json())
+            current = client.get("/transfer-orders/current").json()["order"]
+            if current is not None:
+                validate(current)
+
+    readers = [threading.Thread(target=reader) for _ in range(4)]
+    for thread in readers:
+        thread.start()
+
+    def writer() -> None:
+        go.wait()
+        response = report(client, A, 2, [route("102路", "西站", "东站")])
+        assert response.json()["auto_committed_order"]["status"] == "committed"
+
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    go.wait()
+    writer_thread.join(timeout=10)
+    stop.set()
+    for thread in readers:
+        thread.join(timeout=10)
+
+    final = client.get(f"/transfer-orders/{order_id}").json()
+    assert final["status"] == "committed"
+    assert final["lines"][0]["operator"] == B
+
+
+def test_failed_cancel_keeps_order_open_and_supply_unchanged(client: TestClient) -> None:
+    seed_two_companies(client)
+    order_id = new_order(client, [("101路", A, B)]).json()["id"]
+    report(client, A, 2, [route("102路", "西站", "东站")])
+    assert routes_by_code(client)["101路"]["frozen"] is True
+
+    before_order = client.get(f"/transfer-orders/{order_id}").json()
+    before_routes = client.get("/routes").json()
+
+    response = client.post(f"/transfer-orders/{order_id}/cancel?inject_fault=true")
+    assert response.status_code == 500
+
+    assert client.get(f"/transfer-orders/{order_id}").json() == before_order
+    assert client.get("/routes").json()["routes"] == before_routes["routes"]
+    assert client.get("/transfer-orders/current").json()["order"]["id"] == order_id
+
+    # A clean cancel afterwards still works.
+    response = client.post(f"/transfer-orders/{order_id}/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+
+def test_manual_commit_receipt_carries_committed_lines(
+    env: tuple[Settings, TestClient],
+) -> None:
+    settings, client = env
+    seed_two_companies(client)
+    order_id = new_order(client, [("101路", A, B)]).json()["id"]
+    report(client, A, 2, [route("102路", "西站", "东站")])
+    assert client.get(f"/transfer-orders/{order_id}").json()["status"] == "open"
+
+    # Build the incoming side on a separate connection WITHOUT the auto-commit
+    # path of report_batch, leaving the order open yet fully ready.
+    raw = connect(settings)
+    try:
+        with transaction(raw):
+            at = service.now_iso()
+            cursor = raw.execute(
+                "INSERT INTO batches (company_code, batch_number, received_at, "
+                "route_count, stop_count, payload_hash) VALUES (?, 2, ?, 2, 4, 'test')",
+                (B, at),
+            )
+            batch_id = cursor.lastrowid
+            raw.executemany(
+                "INSERT INTO batch_stops (batch_id, route_code, seq, stop_code, stop_name) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (batch_id, "201路", 1, "S1", "公园"),
+                    (batch_id, "201路", 2, "S2", "医院"),
+                    (batch_id, "101路", 1, "S1", "新甲"),
+                    (batch_id, "101路", 2, "S2", "新乙"),
+                ],
+            )
+            service.recompute_serving(raw, at)
+            assert service._order_is_ready(raw, order_id) is True
+
+        body = service.commit_transfer_order(raw, order_id)
+    finally:
+        raw.close()
+
+    # Receipt is built inside the committing transaction: header, per-line
+    # conditions and serving party all describe the committed state.
+    assert body["status"] == "committed"
+    assert body["committed_at"] is not None
+    assert body["ready"] is True
+    line = body["lines"][0]
+    assert line["operator"] == B
+    assert line["serving_company"] == B
+    assert line["old_withdrawn"] is True
+    assert line["new_reported"] is True
+    assert routes_by_code(client)["101路"]["operator"] == B
+
+    # Repeated manual commit stays idempotent and coherent.
+    raw = connect(settings)
+    try:
+        again = service.commit_transfer_order(raw, order_id)
+    finally:
+        raw.close()
+    assert again["status"] == "committed"
+    assert again["lines"][0]["serving_company"] == B

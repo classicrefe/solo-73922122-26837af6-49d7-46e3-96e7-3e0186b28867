@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from . import service
 from .config import Settings
-from .db import connect, init_db, transaction
+from .db import connect, init_db
 from .errors import AppError, InjectedFault
 from .models import (
     BatchIn,
@@ -149,10 +149,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         request: Request,
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> dict:
-        order_id = service.create_transfer_order(
+        # The receipt is built inside the create transaction, so it always
+        # reflects this write's own committed state.
+        return service.create_transfer_order(
             conn, payload, inject_fault=fault(request)
         )
-        return service.get_order(conn, order_id)
 
     @app.get(
         "/transfer-orders/current",
@@ -185,11 +186,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         request: Request,
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> dict:
-        with transaction(conn):
-            service.commit_order(conn, order_id)
-            if fault(request):
-                raise InjectedFault()
-        return service.get_order(conn, order_id)
+        return service.commit_transfer_order(
+            conn, order_id, inject_fault=fault(request)
+        )
 
     @app.post(
         "/transfer-orders/{order_id}/cancel",
@@ -202,10 +201,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         request: Request,
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> dict:
-        service.cancel_transfer_order(
+        return service.cancel_transfer_order(
             conn, order_id, inject_fault=fault(request)
         )
-        return service.get_order(conn, order_id)
 
     return app
 

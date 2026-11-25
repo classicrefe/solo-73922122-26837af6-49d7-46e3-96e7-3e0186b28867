@@ -123,3 +123,22 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.execute("COMMIT")
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Snapshot read: every statement inside sees the same committed state.
+
+    A deferred ``BEGIN`` takes no write lock, so a long-ish read never blocks
+    concurrent reports; under WAL the snapshot stays valid even while another
+    connection commits in the meantime. Never nest this inside
+    :func:`transaction` on the same connection.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
